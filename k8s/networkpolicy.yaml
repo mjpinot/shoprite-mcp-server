@@ -1,0 +1,46 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: shoprite-mcp-netpol
+  namespace: shoprite-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: shoprite-mcp
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow traffic from nginx ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 9090
+
+  egress:
+    # Allow DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow outbound HTTPS to shoprite.com
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+    # Allow communication to Redis within namespace
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: shoprite-redis
+      ports:
+        - protocol: TCP
+          port: 6379

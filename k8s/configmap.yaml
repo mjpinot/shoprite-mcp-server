@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shoprite-mcp-config
+  namespace: shoprite-mcp
+  labels:
+    app.kubernetes.io/name: shoprite-mcp
+    app.kubernetes.io/component: config
+data:
+  SHOPRITE_BASE_URL: "https://www.shoprite.com"
+  REQUEST_TIMEOUT: "30"
+  MAX_PRODUCTS: "50"
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"

@@ -1,0 +1,128 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Shoprite MCP Server – Docker Compose (development / local)
+# ---------------------------------------------------------------------------
+
+services:
+  # --------------------------------------------------------------------------
+  # MCP Server
+  # --------------------------------------------------------------------------
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: shoprite-mcp-server:latest
+    container_name: shoprite-mcp
+    restart: unless-stopped
+
+    environment:
+      SHOPRITE_BASE_URL: ${SHOPRITE_BASE_URL:-https://www.shoprite.com}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-30}
+      MAX_PRODUCTS: ${MAX_PRODUCTS:-50}
+
+    # MCP over stdio: expose stdin/stdout via a socat relay so that HTTP
+    # clients (e.g. Claude Desktop, cursor) can reach the server over TCP.
+    ports:
+      - "${MCP_PORT:-8080}:8080"
+
+    volumes:
+      # Hot-reload during development – remove in production
+      - ./src:/app/src:ro
+
+    networks:
+      - mcp-net
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import src.server; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # --------------------------------------------------------------------------
+  # MCP SSE Proxy (bridges stdio ↔ HTTP/SSE for remote clients)
+  # --------------------------------------------------------------------------
+  mcp-proxy:
+    image: ghcr.io/sparfenyuk/mcp-proxy:latest
+    container_name: shoprite-mcp-proxy
+    restart: unless-stopped
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+
+    environment:
+      TARGET_COMMAND: "python -m src.server"
+      BIND_HOST: "0.0.0.0"
+      BIND_PORT: "8080"
+
+    ports:
+      - "${PROXY_PORT:-9090}:8080"
+
+    networks:
+      - mcp-net
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # Nginx reverse-proxy (optional, useful for TLS termination locally)
+  # --------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: shoprite-nginx
+    restart: unless-stopped
+    depends_on:
+      - mcp-proxy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    networks:
+      - mcp-net
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # Redis – optional caching layer to reduce Shoprite scraping load
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: shoprite-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD:-changeme}"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mcp-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ---------------------------------------------------------------------------
+# Networks & Volumes
+# ---------------------------------------------------------------------------
+networks:
+  mcp-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local

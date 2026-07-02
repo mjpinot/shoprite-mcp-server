@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: shoprite-mcp
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - secret.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - networkpolicy.yaml
+  - pdb.yaml
+
+commonLabels:
+  app.kubernetes.io/name: shoprite-mcp
+  app.kubernetes.io/managed-by: kustomize
+
+images:
+  - name: ghcr.io/mjpinot/shoprite-mcp-server
+    newTag: latest

@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shoprite-mcp-pdb
+  namespace: shoprite-mcp
+  labels:
+    app.kubernetes.io/name: shoprite-mcp
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shoprite-mcp
+      app.kubernetes.io/component: server

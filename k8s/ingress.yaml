@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shoprite-mcp-ingress
+  namespace: shoprite-mcp
+  labels:
+    app.kubernetes.io/name: shoprite-mcp
+    app.kubernetes.io/component: ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Uncomment to enable cert-manager for TLS:
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  # tls:
+  #   - hosts:
+  #       - mcp.yourdomain.com
+  #     secretName: shoprite-mcp-tls
+  rules:
+    - host: mcp.yourdomain.com    # Replace with your actual domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shoprite-mcp-service
+                port:
+                  name: http
+          - path: /sse
+            pathType: Prefix
+            backend:
+              service:
+                name: shoprite-mcp-service
+                port:
+                  name: sse
