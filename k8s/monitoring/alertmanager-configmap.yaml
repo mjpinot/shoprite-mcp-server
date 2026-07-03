@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: shoprite-mcp
+  labels:
+    app.kubernetes.io/name: alertmanager
+    app.kubernetes.io/component: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+      # SMTP (email) settings — populate via Secret in production
+      smtp_smarthost:     'smtp.gmail.com:587'
+      smtp_from:          'alerts@yourdomain.com'
+      smtp_auth_username: 'alerts@yourdomain.com'
+      smtp_auth_password: '${ALERTMANAGER_SMTP_PASSWORD}'
+      smtp_require_tls:   true
+
+      # Slack — webhook URL populated via Secret
+      slack_api_url: '${ALERTMANAGER_SLACK_WEBHOOK_URL}'
+
+    # -------------------------------------------------------------------------
+    # Templates
+    # -------------------------------------------------------------------------
+    templates:
+      - '/etc/alertmanager/templates/*.tmpl'
+
+    # -------------------------------------------------------------------------
+    # Routing tree
+    # -------------------------------------------------------------------------
+    route:
+      receiver: default-slack
+      group_by: ['alertname', 'namespace', 'tool']
+      group_wait:      30s
+      group_interval:  5m
+      repeat_interval: 4h
+
+      routes:
+        # Critical alerts → immediate Slack + email
+        - match:
+            severity: critical
+          receiver: critical
+          group_wait: 0s
+          repeat_interval: 30m
+          continue: false
+
+        # Warning alerts → Slack only
+        - match:
+            severity: warning
+          receiver: warning-slack
+          group_wait: 1m
+          repeat_interval: 2h
+          continue: false
+
+        # Shoprite-specific team routing
+        - match:
+            team: shoprite-mcp
+          receiver: shoprite-team-slack
+          continue: true
+
+    # -------------------------------------------------------------------------
+    # Inhibit rules: critical suppresses warning for same alert+pod
+    # -------------------------------------------------------------------------
+    inhibit_rules:
+      - source_match:
+          severity: critical
+        target_match:
+          severity: warning
+        equal: ['alertname', 'namespace', 'pod']
+
+    # -------------------------------------------------------------------------
+    # Receivers
+    # -------------------------------------------------------------------------
+    receivers:
+      # Default receiver (warnings to #shoprite-alerts)
+      - name: default-slack
+        slack_configs:
+          - channel: '#shoprite-alerts'
+            send_resolved: true
+            username: 'AlertManager'
+            icon_emoji: ':bell:'
+            color: '{{ if eq .Status "firing" }}{{ if eq (index .GroupLabels "severity") "critical" }}#FF0000{{ else }}#FFA500{{ end }}{{ else }}#36a64f{{ end }}'
+            title: >-
+              {{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }}
+              [{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}
+            text: |
+              {{ range .Alerts }}
+              *Alert:*   {{ .Annotations.summary }}
+              *Details:* {{ .Annotations.description }}
+              *Severity:* {{ .Labels.severity }}
+              *Namespace:* {{ .Labels.namespace }}
+              {{ if .Labels.pod }}*Pod:* {{ .Labels.pod }}{{ end }}
+              *Started:* {{ .StartsAt | since | humanizeDuration }} ago
+              {{ end }}
+
+      # Critical: Slack + email
+      - name: critical
+        slack_configs:
+          - channel: '#shoprite-critical'
+            send_resolved: true
+            username: 'AlertManager'
+            icon_emoji: ':rotating_light:'
+            color: '#FF0000'
+            title: '🚨 [CRITICAL] {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}
+              *Alert:*   {{ .Annotations.summary }}
+              *Details:* {{ .Annotations.description }}
+              *Namespace:* {{ .Labels.namespace }}
+              {{ if .Labels.pod }}*Pod:* {{ .Labels.pod }}{{ end }}
+              *Started:* {{ .StartsAt | since | humanizeDuration }} ago
+              {{ end }}
+        email_configs:
+          - to: 'oncall@yourdomain.com'
+            send_resolved: true
+            headers:
+              Subject: '🚨 [CRITICAL] Shoprite MCP: {{ .GroupLabels.alertname }}'
+            html: |
+              <h2 style="color:red">Critical Alert: {{ .GroupLabels.alertname }}</h2>
+              {{ range .Alerts }}
+              <p><b>Summary:</b> {{ .Annotations.summary }}</p>
+              <p><b>Description:</b> {{ .Annotations.description }}</p>
+              <p><b>Severity:</b> {{ .Labels.severity }}</p>
+              <p><b>Namespace:</b> {{ .Labels.namespace }}</p>
+              <p><b>Started:</b> {{ .StartsAt }}</p>
+              {{ end }}
+
+      # Warning: Slack only
+      - name: warning-slack
+        slack_configs:
+          - channel: '#shoprite-alerts'
+            send_resolved: true
+            username: 'AlertManager'
+            icon_emoji: ':warning:'
+            color: '#FFA500'
+            title: '⚠️ [WARNING] {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}
+              *Alert:*   {{ .Annotations.summary }}
+              *Details:* {{ .Annotations.description }}
+              *Started:* {{ .StartsAt | since | humanizeDuration }} ago
+              {{ end }}
+
+      # Shoprite team
+      - name: shoprite-team-slack
+        slack_configs:
+          - channel: '#shoprite-mcp-team'
+            send_resolved: true
+            username: 'AlertManager'
+            icon_emoji: ':shoprite:'
+            title: '{{ if eq .Status "firing" }}🔔{{ else }}✅{{ end }} {{ .GroupLabels.alertname }}'
+            text: |
+              {{ range .Alerts }}
+              {{ .Annotations.summary }}
+              {{ .Annotations.description }}
+              {{ end }}

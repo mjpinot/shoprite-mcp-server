@@ -18,6 +18,7 @@ consumable by AI assistants such as Claude, Cursor, and any MCP-compatible clien
 - [Available MCP Tools](#available-mcp-tools)
 - [Available MCP Resources](#available-mcp-resources)
 - [CI/CD](#cicd)
+- [Monitoring (Prometheus + Grafana + Alertmanager)](#monitoring-prometheus--grafana--alertmanager)
 - [Development](#development)
 - [Project Structure](#project-structure)
 - [License](#license)
@@ -384,7 +385,7 @@ npx @modelcontextprotocol/inspector python -m src.server
 shoprite-mcp-server/
 ├── src/
 │   ├── __init__.py
-│   └── server.py            # MCP server implementation
+│   └── server.py            # MCP server + Prometheus metrics endpoint
 ├── k8s/
 │   ├── namespace.yaml
 │   ├── serviceaccount.yaml
@@ -396,7 +397,19 @@ shoprite-mcp-server/
 │   ├── hpa.yaml
 │   ├── networkpolicy.yaml
 │   ├── pdb.yaml
-│   └── kustomization.yaml
+│   ├── kustomization.yaml
+│   └── monitoring/
+│       ├── prometheus-rbac.yaml
+│       ├── prometheus-configmap.yaml    # scrape config + 8 alert rules
+│       ├── prometheus-deployment.yaml
+│       ├── alertmanager-secret.yaml     # Slack webhook + SMTP password
+│       ├── alertmanager-configmap.yaml  # routing + receiver config
+│       ├── alertmanager-deployment.yaml
+│       ├── grafana-secret.yaml          # admin credentials
+│       ├── grafana-datasources.yaml
+│       ├── grafana-dashboard.yaml       # 11-panel dashboard
+│       ├── grafana-deployment.yaml
+│       └── servicemonitor.yaml          # for kube-prometheus-stack
 ├── nginx/
 │   ├── nginx.conf
 │   └── conf.d/
@@ -415,6 +428,129 @@ shoprite-mcp-server/
 ├── requirements.txt
 └── README.md
 ```
+
+---
+
+---
+
+## Monitoring (Prometheus + Grafana + Alertmanager)
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    Namespace: shoprite-mcp                       │
+│                                                                  │
+│  ┌──────────────┐   /metrics   ┌─────────────┐                  │
+│  │  MCP Server  │◄─────────────│  Prometheus │──► AlertManager  │
+│  │  :9090       │              │  :9090      │    :9093          │
+│  └──────────────┘              └──────┬──────┘                  │
+│                                       │ datasource              │
+│                                ┌──────▼──────┐                  │
+│                                │   Grafana   │                  │
+│                                │   :3000     │                  │
+│                                └─────────────┘                  │
+└──────────────────────────────────────────────────────────────────┘
+         AlertManager ──► Slack (#shoprite-alerts / #shoprite-critical)
+                      ──► Email (oncall@yourdomain.com)
+```
+
+### Exposed Metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `shoprite_mcp_tool_calls_total` | Counter | Total tool calls, labeled `tool` + `status` (success/error) |
+| `shoprite_mcp_tool_call_duration_seconds` | Histogram | Latency per tool call |
+| `shoprite_mcp_http_request_duration_seconds` | Histogram | Latency of outbound HTTP scrapes to shoprite.com |
+| `shoprite_mcp_http_errors_total` | Counter | HTTP errors by `url_path` and `error_type` |
+| `shoprite_mcp_products_returned` | Histogram | Products returned per search |
+| `shoprite_mcp_active_tool_calls` | Gauge | In-flight tool calls |
+| `shoprite_mcp_info` | Info | Server version and base URL |
+
+Metrics are available at `http://<pod-ip>:9090/metrics`.
+
+### Deploy the monitoring stack
+
+```bash
+# Deploy everything (app + monitoring) in one shot
+kubectl apply -k k8s/
+
+# Check all pods are running
+kubectl get pods -n shoprite-mcp
+
+# Port-forward to Grafana (no Ingress needed for local access)
+kubectl port-forward svc/grafana 3000:3000 -n shoprite-mcp
+# Open http://localhost:3000  — admin / <password from grafana-secret.yaml>
+
+# Port-forward to Prometheus UI
+kubectl port-forward svc/prometheus 9090:9090 -n shoprite-mcp
+# Open http://localhost:9090
+
+# Port-forward to Alertmanager UI
+kubectl port-forward svc/alertmanager 9093:9093 -n shoprite-mcp
+# Open http://localhost:9093
+```
+
+### Grafana Dashboard
+
+The dashboard **"Shoprite MCP Server"** is auto-provisioned at startup and includes:
+
+| Panel | Description |
+|---|---|
+| Tool Calls/s | Request rate per tool |
+| Tool Error Rate (%) | Error % with thresholds (yellow >10%, red >30%) |
+| Tool p50/p95/p99 Latency | Latency percentiles per tool |
+| Active Tool Calls | Real-time in-flight gauge |
+| HTTP Scrape Errors/s | Error rate toward shoprite.com |
+| Outbound HTTP Latency p95 | Upstream latency by URL path |
+| Products Returned (avg) | Average products per search |
+| Pod Memory / CPU | Container resource usage |
+| Available Replicas | Deployment health |
+| Firing Alerts | Live Alertmanager alert list |
+
+### Alert Rules
+
+| Alert | Severity | Condition |
+|---|---|---|
+| `ShopriteMcpHighErrorRate` | warning | Error rate > 10% for 2 min |
+| `ShopriteMcpCriticalErrorRate` | critical | Error rate > 30% for 1 min |
+| `ShopriteMcpHighLatency` | warning | p95 latency > 10s for 3 min |
+| `ShopriteMcpHttpErrors` | warning | Scrape errors > 0.05/s for 2 min |
+| `ShopriteMcpPodDown` | critical | 0 available replicas for 1 min |
+| `ShopriteMcpReplicasMismatch` | warning | Desired ≠ available replicas for 5 min |
+| `ShopriteMcpHighMemory` | warning | Memory > 85% of limit for 5 min |
+| `ShopriteMcpHighCPU` | warning | CPU > 80% of limit for 5 min |
+
+### Configure alert channels
+
+**Slack:**
+1. Create an Incoming Webhook in your Slack workspace.
+2. Edit `k8s/monitoring/alertmanager-secret.yaml` and set `ALERTMANAGER_SLACK_WEBHOOK_URL`.
+3. Update the channel names in `alertmanager-configmap.yaml` (`#shoprite-alerts`, `#shoprite-critical`, `#shoprite-mcp-team`).
+
+**Email:**
+1. Set `ALERTMANAGER_SMTP_PASSWORD` in `alertmanager-secret.yaml`.
+2. Update `smtp_from`, `smtp_auth_username`, and the `to:` address in `alertmanager-configmap.yaml`.
+
+> In production, replace plain `Secret` objects with [Sealed Secrets](https://github.com/bitnami-labs/sealed-secrets)
+> or [External Secrets Operator](https://external-secrets.io/) to avoid committing credentials.
+
+### With kube-prometheus-stack (Prometheus Operator)
+
+If your cluster already runs **kube-prometheus-stack**, use the `ServiceMonitor` instead
+of deploying standalone Prometheus:
+
+```bash
+# 1. Skip the standalone Prometheus (comment it out in kustomization.yaml)
+# 2. Apply only the ServiceMonitor:
+kubectl apply -f k8s/monitoring/servicemonitor.yaml
+
+# 3. Verify it's picked up:
+kubectl get servicemonitor -n shoprite-mcp
+```
+
+The `ServiceMonitor` label `release: kube-prometheus-stack` must match the
+`serviceMonitorSelector` configured in your Prometheus Operator instance.
 
 ---
 

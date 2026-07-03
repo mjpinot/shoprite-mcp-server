@@ -1,0 +1,35 @@
+# ServiceMonitor tells kube-prometheus-stack's Prometheus Operator to scrape
+# the shoprite-mcp-server pods automatically.
+#
+# Prerequisites:
+#   - kube-prometheus-stack installed (https://github.com/prometheus-community/helm-charts)
+#   - Prometheus Operator CRDs available (monitoring.coreos.com/v1)
+#
+# If you're NOT using the Prometheus Operator (i.e. you deployed our standalone
+# Prometheus from prometheus-deployment.yaml) you don't need this file —
+# the annotation-based scrape config in prometheus-configmap.yaml is enough.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: shoprite-mcp-server
+  namespace: shoprite-mcp
+  labels:
+    app.kubernetes.io/name: shoprite-mcp
+    app.kubernetes.io/component: monitoring
+    # This label must match the Prometheus Operator's serviceMonitorSelector.
+    # Default for kube-prometheus-stack:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shoprite-mcp
+      app.kubernetes.io/component: server
+  namespaceSelector:
+    matchNames:
+      - shoprite-mcp
+  endpoints:
+    - port: metrics          # Must match the named port in service.yaml
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true

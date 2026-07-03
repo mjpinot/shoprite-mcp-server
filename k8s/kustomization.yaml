@@ -4,6 +4,7 @@ kind: Kustomization
 namespace: shoprite-mcp
 
 resources:
+  # -- Core application --
   - namespace.yaml
   - serviceaccount.yaml
   - configmap.yaml
@@ -14,6 +15,21 @@ resources:
   - hpa.yaml
   - networkpolicy.yaml
   - pdb.yaml
+
+  # -- Monitoring stack --
+  - monitoring/prometheus-rbac.yaml
+  - monitoring/prometheus-configmap.yaml
+  - monitoring/prometheus-deployment.yaml
+  - monitoring/alertmanager-secret.yaml
+  - monitoring/alertmanager-configmap.yaml
+  - monitoring/alertmanager-deployment.yaml
+  - monitoring/grafana-secret.yaml
+  - monitoring/grafana-datasources.yaml
+  - monitoring/grafana-dashboard.yaml
+  - monitoring/grafana-deployment.yaml
+  # ServiceMonitor requires Prometheus Operator (kube-prometheus-stack).
+  # Comment out if not using the Operator:
+  - monitoring/servicemonitor.yaml
 
 commonLabels:
   app.kubernetes.io/name: shoprite-mcp

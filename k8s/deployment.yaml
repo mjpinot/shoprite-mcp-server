@@ -25,7 +25,10 @@ spec:
         app.kubernetes.io/component: server
         app.kubernetes.io/version: "1.0.0"
       annotations:
-        prometheus.io/scrape: "false"
+        # Prometheus scrape annotations (for vanilla Prometheus without ServiceMonitor)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: shoprite-mcp-sa
       securityContext:
@@ -38,6 +41,11 @@ spec:
         - name: mcp-server
           image: ghcr.io/mjpinot/shoprite-mcp-server:latest
           imagePullPolicy: Always
+
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
 
           envFrom:
             - configMapRef:
@@ -54,22 +62,18 @@ spec:
               memory: "256Mi"
 
           livenessProbe:
-            exec:
-              command:
-                - python
-                - -c
-                - "import src.server; print('ok')"
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 15
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3
 
           readinessProbe:
-            exec:
-              command:
-                - python
-                - -c
-                - "import src.server; print('ok')"
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 5

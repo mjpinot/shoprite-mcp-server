@@ -1,0 +1,237 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: shoprite-mcp
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval:     15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: shoprite-mcp
+        environment: production
+
+    # Alertmanager connection
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager:9093
+
+    # Load alert rules
+    rule_files:
+      - /etc/prometheus/rules/*.yaml
+
+    scrape_configs:
+      # -----------------------------------------------------------------------
+      # Shoprite MCP Server
+      # -----------------------------------------------------------------------
+      - job_name: shoprite-mcp-server
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - shoprite-mcp
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+
+      # -----------------------------------------------------------------------
+      # kube-state-metrics (if installed)
+      # -----------------------------------------------------------------------
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: ['kube-state-metrics.kube-system:8080']
+
+      # -----------------------------------------------------------------------
+      # Kubernetes nodes cAdvisor
+      # -----------------------------------------------------------------------
+      - job_name: kubernetes-nodes-cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+
+  rules.yaml: |
+    groups:
+      # -----------------------------------------------------------------------
+      # Shoprite MCP Server alerts
+      # -----------------------------------------------------------------------
+      - name: shoprite-mcp-server
+        interval: 30s
+        rules:
+
+          # High error rate on tool calls
+          - alert: ShopriteMcpHighErrorRate
+            expr: |
+              (
+                rate(shoprite_mcp_tool_calls_total{status="error"}[5m])
+                /
+                rate(shoprite_mcp_tool_calls_total[5m])
+              ) > 0.10
+            for: 2m
+            labels:
+              severity: warning
+              team: shoprite-mcp
+            annotations:
+              summary: "High MCP tool error rate ({{ $labels.tool }})"
+              description: >
+                Tool {{ $labels.tool }} has an error rate of
+                {{ $value | humanizePercentage }} over the last 5 minutes.
+                Pod: {{ $labels.pod }}
+
+          # Critical error rate
+          - alert: ShopriteMcpCriticalErrorRate
+            expr: |
+              (
+                rate(shoprite_mcp_tool_calls_total{status="error"}[5m])
+                /
+                rate(shoprite_mcp_tool_calls_total[5m])
+              ) > 0.30
+            for: 1m
+            labels:
+              severity: critical
+              team: shoprite-mcp
+            annotations:
+              summary: "Critical MCP tool error rate ({{ $labels.tool }})"
+              description: >
+                Tool {{ $labels.tool }} has an error rate of
+                {{ $value | humanizePercentage }} — exceeds 30% threshold.
+                Immediate action required. Pod: {{ $labels.pod }}
+
+          # Slow tool response
+          - alert: ShopriteMcpHighLatency
+            expr: |
+              histogram_quantile(0.95,
+                rate(shoprite_mcp_tool_call_duration_seconds_bucket[5m])
+              ) > 10
+            for: 3m
+            labels:
+              severity: warning
+              team: shoprite-mcp
+            annotations:
+              summary: "MCP tool p95 latency > 10s ({{ $labels.tool }})"
+              description: >
+                Tool {{ $labels.tool }} p95 latency is {{ $value | humanizeDuration }}.
+                Check Shoprite website availability or network issues.
+
+          # HTTP scraping errors
+          - alert: ShopriteMcpHttpErrors
+            expr: |
+              rate(shoprite_mcp_http_errors_total[5m]) > 0.05
+            for: 2m
+            labels:
+              severity: warning
+              team: shoprite-mcp
+            annotations:
+              summary: "Shoprite HTTP scraping errors ({{ $labels.error_type }})"
+              description: >
+                Error rate {{ $value | humanize }}/s for path {{ $labels.url_path }},
+                error type {{ $labels.error_type }}.
+
+          # Pod not available
+          - alert: ShopriteMcpPodDown
+            expr: |
+              kube_deployment_status_replicas_available{
+                namespace="shoprite-mcp",
+                deployment="shoprite-mcp-server"
+              } < 1
+            for: 1m
+            labels:
+              severity: critical
+              team: shoprite-mcp
+            annotations:
+              summary: "No Shoprite MCP pods available"
+              description: >
+                The shoprite-mcp-server deployment has 0 available replicas.
+                Service is completely down.
+
+          # Fewer replicas than desired
+          - alert: ShopriteMcpReplicasMismatch
+            expr: |
+              kube_deployment_spec_replicas{
+                namespace="shoprite-mcp",
+                deployment="shoprite-mcp-server"
+              }
+              !=
+              kube_deployment_status_replicas_available{
+                namespace="shoprite-mcp",
+                deployment="shoprite-mcp-server"
+              }
+            for: 5m
+            labels:
+              severity: warning
+              team: shoprite-mcp
+            annotations:
+              summary: "Shoprite MCP deployment replica mismatch"
+              description: >
+                Desired replicas do not match available replicas for
+                shoprite-mcp-server for more than 5 minutes.
+
+          # High memory usage
+          - alert: ShopriteMcpHighMemory
+            expr: |
+              container_memory_working_set_bytes{
+                namespace="shoprite-mcp",
+                container="mcp-server"
+              } / (256 * 1024 * 1024) > 0.85
+            for: 5m
+            labels:
+              severity: warning
+              team: shoprite-mcp
+            annotations:
+              summary: "Shoprite MCP server high memory usage"
+              description: >
+                Container mcp-server is using {{ $value | humanizePercentage }}
+                of its 256Mi memory limit. Pod: {{ $labels.pod }}
+
+          # High CPU usage
+          - alert: ShopriteMcpHighCPU
+            expr: |
+              rate(container_cpu_usage_seconds_total{
+                namespace="shoprite-mcp",
+                container="mcp-server"
+              }[5m]) / 0.5 > 0.80
+            for: 5m
+            labels:
+              severity: warning
+              team: shoprite-mcp
+            annotations:
+              summary: "Shoprite MCP server high CPU usage"
+              description: >
+                Container mcp-server is using {{ $value | humanizePercentage }}
+                of its 500m CPU limit. Pod: {{ $labels.pod }}

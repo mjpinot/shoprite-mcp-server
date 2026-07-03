@@ -2,14 +2,19 @@
 Shoprite MCP Server
 Implements the Model Context Protocol (MCP) to expose Shoprite product/deal data
 as tools and resources consumable by AI assistants.
+
+Exposes a Prometheus /metrics endpoint on METRICS_PORT (default 9090) so that
+Prometheus (or kube-prometheus-stack via ServiceMonitor) can scrape it.
 """
 
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 import httpx
+from aiohttp import web
 from bs4 import BeautifulSoup
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
@@ -23,6 +28,15 @@ from mcp.types import (
 )
 from pydantic import AnyUrl
 import mcp.types as types
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    Info,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -39,6 +53,7 @@ logger = logging.getLogger("shoprite-mcp")
 BASE_URL = os.getenv("SHOPRITE_BASE_URL", "https://www.shoprite.com")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 MAX_PRODUCTS = int(os.getenv("MAX_PRODUCTS", "50"))
+METRICS_PORT = int(os.getenv("METRICS_PORT", "9090"))
 
 HEADERS = {
     "User-Agent": (
@@ -50,19 +65,90 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+# Tool call counters
+TOOL_CALLS_TOTAL = Counter(
+    "shoprite_mcp_tool_calls_total",
+    "Total number of MCP tool calls",
+    ["tool", "status"],  # status: success | error
+)
+
+# Tool call latency
+TOOL_CALL_DURATION = Histogram(
+    "shoprite_mcp_tool_call_duration_seconds",
+    "Duration of MCP tool calls in seconds",
+    ["tool"],
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+
+# HTTP scrape latency to shoprite.com
+HTTP_REQUEST_DURATION = Histogram(
+    "shoprite_mcp_http_request_duration_seconds",
+    "Duration of outbound HTTP requests to Shoprite",
+    ["url_path"],
+    buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
+)
+
+# HTTP errors
+HTTP_ERRORS_TOTAL = Counter(
+    "shoprite_mcp_http_errors_total",
+    "Total HTTP errors when scraping Shoprite",
+    ["url_path", "error_type"],
+)
+
+# Products returned per search
+PRODUCTS_RETURNED = Histogram(
+    "shoprite_mcp_products_returned",
+    "Number of products returned per search",
+    buckets=(0, 1, 5, 10, 20, 50),
+)
+
+# Active tool calls in flight
+ACTIVE_TOOL_CALLS = Gauge(
+    "shoprite_mcp_active_tool_calls",
+    "Number of MCP tool calls currently in progress",
+)
+
+# Server info
+SERVER_INFO = Info(
+    "shoprite_mcp",
+    "Shoprite MCP Server build information",
+)
+SERVER_INFO.info({
+    "version": "1.0.0",
+    "base_url": BASE_URL,
+})
+
+# ---------------------------------------------------------------------------
 # HTTP client helpers
 # ---------------------------------------------------------------------------
 
 async def fetch_page(url: str) -> str:
-    """Fetch a URL and return its HTML content."""
-    async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT,
-        follow_redirects=True,
-        headers=HEADERS,
-    ) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        return response.text
+    """Fetch a URL and return its HTML content, recording Prometheus metrics."""
+    from urllib.parse import urlparse
+    path = urlparse(url).path or "/"
+
+    start = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT,
+            follow_redirects=True,
+            headers=HEADERS,
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.text
+    except httpx.HTTPStatusError as exc:
+        HTTP_ERRORS_TOTAL.labels(url_path=path, error_type="http_status").inc()
+        raise
+    except httpx.RequestError as exc:
+        HTTP_ERRORS_TOTAL.labels(url_path=path, error_type="request_error").inc()
+        raise
+    finally:
+        HTTP_REQUEST_DURATION.labels(url_path=path).observe(
+            time.perf_counter() - start
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -70,20 +156,17 @@ async def fetch_page(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 def parse_products_from_html(html: str) -> list[dict[str, Any]]:
-    """Parse product listings from a Shoprite category page."""
+    """Parse product listings from a Shoprite category/search page."""
     soup = BeautifulSoup(html, "html.parser")
     products: list[dict[str, Any]] = []
 
-    # Shoprite uses different selectors depending on the page variant;
-    # try the most common patterns.
     selectors = [
         "div.product-grid__item",
         "div[data-testid='product-card']",
         "li.product-item",
         "div.product-tile",
     ]
-
-    items = []
+    items: list = []
     for selector in selectors:
         items = soup.select(selector)
         if items:
@@ -129,8 +212,7 @@ def parse_weekly_deals(html: str) -> list[dict[str, Any]]:
         "li.deal-item",
         "div.circular-item",
     ]
-
-    items = []
+    items: list = []
     for selector in selectors:
         items = soup.select(selector)
         if items:
@@ -164,8 +246,7 @@ def parse_store_locations(html: str) -> list[dict[str, Any]]:
         "li.store-item",
         "div[data-testid='store-card']",
     ]
-
-    items = []
+    items: list = []
     for selector in selectors:
         items = soup.select(selector)
         if items:
@@ -187,6 +268,37 @@ def parse_store_locations(html: str) -> list[dict[str, Any]]:
         )
 
     return stores
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics HTTP server (aiohttp, port METRICS_PORT)
+# ---------------------------------------------------------------------------
+
+async def metrics_handler(request: web.Request) -> web.Response:
+    """Serve Prometheus metrics on GET /metrics."""
+    data = generate_latest(REGISTRY)
+    return web.Response(
+        body=data,
+        content_type=CONTENT_TYPE_LATEST.split(";")[0].strip(),
+        headers={"Content-Type": CONTENT_TYPE_LATEST},
+    )
+
+
+async def healthz_handler(request: web.Request) -> web.Response:
+    """Simple liveness probe endpoint."""
+    return web.Response(text="ok\n", content_type="text/plain")
+
+
+async def start_metrics_server() -> None:
+    """Start the aiohttp metrics server in the background."""
+    app = web.Application()
+    app.router.add_get("/metrics", metrics_handler)
+    app.router.add_get("/healthz", healthz_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", METRICS_PORT)
+    await site.start()
+    logger.info("Prometheus metrics server listening on :%d/metrics", METRICS_PORT)
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +339,7 @@ async def read_resource(uri: AnyUrl) -> str:
     url = str(uri)
     logger.info("Reading resource: %s", url)
     try:
-        html = await fetch_page(url)
-        return html
+        return await fetch_page(url)
     except httpx.HTTPStatusError as exc:
         raise ValueError(f"HTTP error {exc.response.status_code} fetching {url}") from exc
     except httpx.RequestError as exc:
@@ -323,6 +434,27 @@ async def call_tool(
 ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
     """Dispatch and execute the requested tool."""
 
+    ACTIVE_TOOL_CALLS.inc()
+    start = time.perf_counter()
+    status = "success"
+
+    try:
+        result = await _dispatch_tool(name, arguments)
+        return result
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        ACTIVE_TOOL_CALLS.dec()
+        TOOL_CALLS_TOTAL.labels(tool=name, status=status).inc()
+        TOOL_CALL_DURATION.labels(tool=name).observe(time.perf_counter() - start)
+
+
+async def _dispatch_tool(
+    name: str, arguments: dict[str, Any]
+) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+    """Inner dispatch — called by call_tool after metrics bookkeeping."""
+
     if name == "search_products":
         query = arguments.get("query", "").strip()
         if not query:
@@ -338,6 +470,8 @@ async def call_tool(
         except Exception as exc:
             logger.error("search_products failed: %s", exc)
             raise types.McpError(INTERNAL_ERROR, f"Failed to search products: {exc}") from exc
+
+        PRODUCTS_RETURNED.observe(len(products))
 
         if not products:
             result_text = f"No products found for '{query}' on Shoprite."
@@ -432,7 +566,7 @@ async def call_tool(
                 or soup.select_one(".description")
             )
 
-            lines = [f"**Product Details**\n"]
+            lines = ["**Product Details**\n"]
             lines.append(f"Title:       {title.get_text(strip=True) if title else 'N/A'}")
             lines.append(f"Price:       {price.get_text(strip=True) if price else 'N/A'}")
             lines.append(
@@ -443,7 +577,9 @@ async def call_tool(
 
         except Exception as exc:
             logger.error("get_product_details failed: %s", exc)
-            raise types.McpError(INTERNAL_ERROR, f"Failed to fetch product details: {exc}") from exc
+            raise types.McpError(
+                INTERNAL_ERROR, f"Failed to fetch product details: {exc}"
+            ) from exc
 
         return [TextContent(type="text", text=result_text)]
 
@@ -452,11 +588,14 @@ async def call_tool(
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point — runs MCP (stdio) + metrics server concurrently
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
     logger.info("Starting Shoprite MCP Server…")
+    # Launch metrics HTTP server as background task
+    await start_metrics_server()
+
     async with stdio_server() as (read_stream, write_stream):
         await app.run(
             read_stream,
